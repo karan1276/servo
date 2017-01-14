@@ -46,7 +46,7 @@ use dom::element::Element;
 use dom::event::{Event, EventBubbles, EventCancelable};
 use dom::globalscope::GlobalScope;
 use dom::htmlanchorelement::HTMLAnchorElement;
-use dom::htmliframeelement::HTMLIFrameElement;
+use dom::htmliframeelement::{HTMLIFrameElement, NavigationType};
 use dom::node::{Node, NodeDamage, window_from_node};
 use dom::serviceworker::TrustedServiceWorkerAddress;
 use dom::serviceworkerregistration::ServiceWorkerRegistration;
@@ -990,10 +990,12 @@ impl ScriptThread {
                                                  event),
             ConstellationControlMsg::UpdatePipelineId(parent_pipeline_id,
                                                       frame_id,
-                                                      new_pipeline_id) =>
+                                                      new_pipeline_id,
+                                                      sender) =>
                 self.handle_update_pipeline_id(parent_pipeline_id,
                                                frame_id,
-                                               new_pipeline_id),
+                                               new_pipeline_id,
+                                               sender),
             ConstellationControlMsg::FocusIFrame(parent_pipeline_id, frame_id) =>
                 self.handle_focus_iframe_msg(parent_pipeline_id, frame_id),
             ConstellationControlMsg::WebDriverScriptCommand(pipeline_id, msg) =>
@@ -1435,10 +1437,14 @@ impl ScriptThread {
     fn handle_update_pipeline_id(&self,
                                  parent_pipeline_id: PipelineId,
                                  frame_id: FrameId,
-                                 new_pipeline_id: PipelineId) {
+                                 new_pipeline_id: PipelineId,
+                                 sender: Option<IpcSender<()>>) {
         let frame_element = self.documents.borrow().find_iframe(parent_pipeline_id, frame_id);
         if let Some(frame_element) = frame_element {
-            frame_element.update_pipeline_id(new_pipeline_id);
+            frame_element.update_pipeline_id(new_pipeline_id, true);
+        }
+        if let Some(sender) = sender {
+            let _ = sender.send(());
         }
     }
 
@@ -1758,9 +1764,7 @@ impl ScriptThread {
                                  incomplete.parent_info,
                                  incomplete.window_size,
                                  self.webvr_thread.clone());
-        let frame_element = frame_element.r().map(Castable::upcast);
-
-        let browsing_context = BrowsingContext::new(&window, frame_element);
+        let browsing_context = BrowsingContext::new(&window, frame_element.r().map(Castable::upcast));
         window.init_browsing_context(&browsing_context);
 
         let last_modified = metadata.headers.as_ref().and_then(|headers| {
@@ -1836,6 +1840,23 @@ impl ScriptThread {
         }
 
         self.documents.borrow_mut().insert(incomplete.pipeline_id, &*document);
+
+        // Notify iframe that the new document is active
+        if let Some(frame_element) = frame_element {
+            // This is a load occuring inside and iframe in this script thread.
+            // The iframe must update its current PipelineId.
+            frame_element.update_pipeline_id(incomplete.pipeline_id, false);
+        } else if incomplete.parent_info.is_some() {
+            // This is a load occuring inside an iframe in another script thread.
+            // The iframe must be synchronously notified to update its current PipelineId.
+            let (sender, receiver) = ipc::channel().expect("Failed to create ipc channel.");
+
+            self.constellation_chan
+                .send(ConstellationMsg::UpdateIframePipelineId(incomplete.pipeline_id, sender))
+                .unwrap();
+
+            let _ = receiver.recv();
+        }
 
         window.init_document(&document);
 
@@ -2069,7 +2090,7 @@ impl ScriptThread {
             Some(frame_id) => {
                 let iframe = self.documents.borrow().find_iframe(parent_pipeline_id, frame_id);
                 if let Some(iframe) = iframe {
-                    iframe.navigate_or_reload_child_browsing_context(Some(load_data), replace);
+                    iframe.navigate_or_reload_child_browsing_context(Some(load_data), NavigationType::Normal, replace);
                 }
             }
             None => {
